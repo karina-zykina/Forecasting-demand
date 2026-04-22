@@ -1,9 +1,6 @@
 .idea/
 __pycache__/
 **/__pycache__/
-*.pyc
-*.pyo
-*.pyd
 .pytest_cache/
 .coverage
 dist/
@@ -11,5 +8,4 @@ build/
 *.egg-info/
 artifacts/
 *.zip
-*.gz
 *.tmp
