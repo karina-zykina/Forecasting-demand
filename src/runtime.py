@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 
+
 def setup_local_vendor() -> None:
     project_root = Path(__file__).resolve().parents[1]
 
