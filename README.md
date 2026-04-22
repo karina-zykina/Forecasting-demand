@@ -278,10 +278,6 @@ Forecasting-demand/
 |       |-- train.py
 |       |-- evaluate.py
 |       `-- predict.py
-|-- examples/
-|   `-- client_usage.py
-|-- tests/
-|   `-- test_demand_forecasting.py
 |-- pyproject.toml
 |-- requirements.txt
 `-- README.md
