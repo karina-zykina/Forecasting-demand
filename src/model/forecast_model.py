@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pickle
 import zipfile
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,7 @@ class DemandForecastModel:
         self.target_mean_: float = 0.0
         self.quality_metrics_: dict[str, float] = {}
         self.quality_score_: float | None = None
+        self.tuning_results_: dict[str, Any] = {}
 
     def fit(self, df: pd.DataFrame) -> "DemandForecastModel":
         prepared = prepare_dataframe(
@@ -122,6 +124,112 @@ class DemandForecastModel:
         self.last_date_ = prepared[self.date_column].max()
         self.target_mean_ = float(prepared[self.target_column].mean())
         return self
+
+    def tune_hyperparameters(
+        self,
+        df: pd.DataFrame,
+        max_trials: int = 4,
+        fit_best: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Quickly tune a small set of LightGBM + CatBoost hyperparameter profiles.
+
+        The method uses the same time-based validation split as fit(...), scores
+        candidates by SMAPE, and keeps the search intentionally small so it stays
+        practical for interactive use.
+        """
+        if max_trials <= 0:
+            raise ValueError("max_trials must be a positive integer.")
+
+        original_config = self.config
+        prepared = prepare_dataframe(
+            df=df,
+            date_column=self.date_column,
+            target_column=self.target_column,
+            feature_columns=self.feature_columns,
+            group_columns=self.group_columns,
+            require_target=True,
+        )
+
+        if len(prepared) < self.config.min_history:
+            raise ValueError(f"Need at least {self.config.min_history} rows, got {len(prepared)}.")
+
+        raw_features, targets = build_training_frame(
+            frame=prepared,
+            date_column=self.date_column,
+            target_column=self.target_column,
+            feature_columns=self.feature_columns,
+            group_columns=self.group_columns,
+            lags=self.config.lags,
+            rolling_windows=self.config.rolling_windows,
+        )
+
+        if raw_features.empty:
+            raise ValueError("Not enough history to build lag features.")
+
+        split_index = self._get_split_index(len(raw_features))
+        if split_index is None:
+            raise ValueError(
+                "Not enough rows for validation-based tuning. "
+                "Use more history or lower min_validation_size/validation_fraction."
+            )
+
+        encoder_state = fit_encoder(raw_features)
+        x = transform_features(raw_features, encoder_state)
+        y = targets.to_numpy(dtype=float)
+        x_train = x.iloc[:split_index].to_numpy()
+        x_valid = x.iloc[split_index:].to_numpy()
+        y_train = y[:split_index]
+        y_valid = y[split_index:]
+
+        candidates = self._build_hyperparameter_candidates(max_trials=max_trials)
+        trials: list[dict[str, Any]] = []
+
+        try:
+            for trial_index, candidate_config in enumerate(candidates, start=1):
+                self.config = candidate_config
+                models = self._fit_all_models(x_train, y_train)
+                valid_pred = self._predict_with_models(models, x_valid)
+                metrics = self._calculate_metrics(y_valid, valid_pred)
+                trials.append(
+                    {
+                        "trial": trial_index,
+                        "metrics": metrics,
+                        "quality_score": max(0.0, min(1.0, 1.0 - metrics["smape"] / 100.0)),
+                        "config": candidate_config.to_dict(),
+                    }
+                )
+        finally:
+            self.config = original_config
+
+        trials.sort(key=lambda item: item["metrics"]["smape"])
+        best_trial = trials[0]
+        best_config = ForecastModelConfig.from_dict(best_trial["config"])
+
+        self.config = best_config
+        self.tuning_results_ = {
+            "best_trial": best_trial["trial"],
+            "best_metrics": best_trial["metrics"],
+            "best_quality_score": best_trial["quality_score"],
+            "trials": trials,
+        }
+
+        if fit_best:
+            self.fit(df)
+            self.tuning_results_ = {
+                "best_trial": best_trial["trial"],
+                "best_metrics": best_trial["metrics"],
+                "best_quality_score": best_trial["quality_score"],
+                "trials": trials,
+            }
+
+        return {
+            "best_config": best_config.to_dict(),
+            "best_trial": best_trial["trial"],
+            "best_metrics": best_trial["metrics"],
+            "best_quality_score": best_trial["quality_score"],
+            "trials": trials,
+        }
 
     def predict(self, future_df: pd.DataFrame | None = None, horizon: int | None = None) -> pd.DataFrame:
         self._check_is_fitted()
@@ -262,6 +370,7 @@ class DemandForecastModel:
                 "target_mean_": self.target_mean_,
                 "quality_metrics_": self.quality_metrics_,
                 "quality_score_": self.quality_score_,
+                "tuning_results_": self.tuning_results_,
             },
         }
 
@@ -291,6 +400,7 @@ class DemandForecastModel:
             "group_columns": self.group_columns,
             "quality_score": self.quality_score_,
             "quality_metrics": self.quality_metrics_,
+            "tuning_results": self.tuning_results_,
             "n_history_rows": len(self.history_),
             "n_model_features": len(self.encoder_state_["feature_names"]),
         }
@@ -324,6 +434,86 @@ class DemandForecastModel:
             payload["validation_fraction"] = validation_fraction
 
         return ForecastModelConfig.from_dict(payload)
+
+    def _build_hyperparameter_candidates(self, max_trials: int) -> list[ForecastModelConfig]:
+        base_payload = self.config.to_dict()
+        overrides = [
+            {},
+            {
+                "lightgbm_params": {
+                    "n_estimators": 120,
+                    "learning_rate": 0.08,
+                    "max_depth": 4,
+                    "num_leaves": 15,
+                },
+                "catboost_params": {
+                    "iterations": 120,
+                    "learning_rate": 0.08,
+                    "depth": 4,
+                    "l2_leaf_reg": 5.0,
+                },
+            },
+            {
+                "lightgbm_params": {
+                    "n_estimators": 180,
+                    "learning_rate": 0.05,
+                    "max_depth": 5,
+                    "num_leaves": 31,
+                },
+                "catboost_params": {
+                    "iterations": 180,
+                    "learning_rate": 0.05,
+                    "depth": 5,
+                    "l2_leaf_reg": 3.0,
+                },
+            },
+            {
+                "lightgbm_params": {
+                    "n_estimators": 220,
+                    "learning_rate": 0.03,
+                    "max_depth": 6,
+                    "num_leaves": 31,
+                },
+                "catboost_params": {
+                    "iterations": 220,
+                    "learning_rate": 0.03,
+                    "depth": 6,
+                    "l2_leaf_reg": 3.0,
+                },
+            },
+            {
+                "ensemble_weights": {
+                    "lightgbm": 0.65,
+                    "catboost": 0.35,
+                },
+            },
+            {
+                "ensemble_weights": {
+                    "lightgbm": 0.35,
+                    "catboost": 0.65,
+                },
+            },
+        ]
+
+        candidates: list[ForecastModelConfig] = []
+        seen: set[str] = set()
+        for override in overrides[:max_trials]:
+            payload = deepcopy(base_payload)
+            self._deep_update(payload, override)
+            config = ForecastModelConfig.from_dict(payload)
+            key = repr(config.to_dict())
+            if key not in seen:
+                seen.add(key)
+                candidates.append(config)
+
+        return candidates
+
+    def _deep_update(self, target: dict[str, Any], override: dict[str, Any]) -> None:
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                target[key].update(value)
+            else:
+                target[key] = value
 
     def _fit_all_models(self, x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
         lightgbm_dataset = lgb.Dataset(x, label=y)

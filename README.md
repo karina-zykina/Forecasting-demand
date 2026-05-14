@@ -391,7 +391,8 @@ model = DemandForecastModel(
     config=config,
 )
 
-model.fit(df)
+tuning = model.tune_hyperparameters(df, max_trials=4)
+print(tuning["best_metrics"])
 
 print(model.quality_metrics_)
 print(model.quality_score_)
@@ -454,6 +455,7 @@ from demand_forecasting import DemandForecastModel, ForecastModelConfig
 Основные методы:
 
 - `fit(df)` обучает модель;
+- `tune_hyperparameters(df, max_trials=4)` быстро подбирает несколько простых вариантов гиперпараметров и переобучает модель на лучших настройках;
 - `predict(future_df)` строит прогноз по будущей таблице;
 - `forecast(horizon)` строит прогноз только по горизонту;
 - `predict_by_sku(sku_column, future_df)` возвращает прогноз в формате `SKU: количество`;
