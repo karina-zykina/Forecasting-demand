@@ -198,18 +198,47 @@ class DemandForecastModel:
         forecast = self.forecast(horizon=horizon, future_features=future_features)
         return self._forecast_to_sku_mapping(forecast, sku_column=sku_column)
 
-    def get_feature_importance(self) -> dict[str, float]:
+    def get_feature_importance(
+        self,
+        plot: bool = True,
+        top_n: int | None = None,
+        show: bool = True,
+        ax: Any | None = None,
+        figsize: tuple[float, float] | None = None,
+    ) -> dict[str, float]:
+        """
+        Return ensemble feature importances and optionally draw a bar chart.
+
+        Importance is calculated for each base model, normalized inside that
+        model, and then combined with the same weights that are used for
+        ensemble predictions.
+        """
         self._check_is_fitted()
 
         feature_names = self.encoder_state_["feature_names"]
-        lgb_importance = self._normalize_importance(self.lightgbm_model_.feature_importances_)
-        xgb_importance = self._normalize_importance(self.xgboost_model_.feature_importances_)
+        weights = self._normalized_ensemble_weights()
+        lgb_importance = self._get_lightgbm_feature_importance()
+        xgb_importance = self._get_xgboost_feature_importance()
 
         result: dict[str, float] = {}
         for index, feature_name in enumerate(feature_names):
-            result[feature_name] = float((lgb_importance[index] + xgb_importance[index]) / 2.0)
+            result[feature_name] = float(
+                weights["lightgbm"] * lgb_importance[index]
+                + weights["xgboost"] * xgb_importance[index]
+            )
 
-        return dict(sorted(result.items(), key=lambda item: item[1], reverse=True))
+        sorted_result = dict(sorted(result.items(), key=lambda item: item[1], reverse=True))
+
+        if plot:
+            self._plot_feature_importance(
+                sorted_result,
+                top_n=top_n,
+                show=show,
+                ax=ax,
+                figsize=figsize,
+            )
+
+        return sorted_result
 
     def save(self, path: str) -> None:
         self._check_is_fitted()
@@ -438,6 +467,63 @@ class DemandForecastModel:
         if total <= 0:
             return np.zeros_like(values, dtype=float)
         return values / total
+
+    def _get_lightgbm_feature_importance(self) -> np.ndarray:
+        importance = self.lightgbm_model_.feature_importance(importance_type="gain")
+        return self._normalize_importance(importance)
+
+    def _get_xgboost_feature_importance(self) -> np.ndarray:
+        feature_names = self.encoder_state_["feature_names"]
+        score = self.xgboost_model_.get_score(importance_type="gain")
+        importance = np.zeros(len(feature_names), dtype=float)
+
+        for index in range(len(feature_names)):
+            importance[index] = float(score.get(f"f{index}", 0.0))
+
+        return self._normalize_importance(importance)
+
+    def _plot_feature_importance(
+        self,
+        importance: dict[str, float],
+        top_n: int | None,
+        show: bool,
+        ax: Any | None,
+        figsize: tuple[float, float] | None,
+    ) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise ImportError(
+                "matplotlib is required to draw feature importance. "
+                "Install it or call get_feature_importance(plot=False)."
+            ) from exc
+
+        items = list(importance.items())
+        if top_n is not None:
+            if top_n <= 0:
+                raise ValueError("top_n must be a positive integer or None.")
+            items = items[:top_n]
+
+        plot_frame = pd.DataFrame(items, columns=["feature", "importance"])
+        plot_frame = plot_frame.sort_values("importance", ascending=True)
+
+        if ax is None:
+            if figsize is None:
+                height = max(4.0, min(18.0, 0.35 * len(plot_frame) + 1.5))
+                figsize = (10.0, height)
+            _, ax = plt.subplots(figsize=figsize)
+
+        ax.barh(plot_frame["feature"], plot_frame["importance"], color="#2F80ED")
+        ax.set_title("Ensemble feature importance")
+        ax.set_xlabel("Normalized importance")
+        ax.set_ylabel("")
+        ax.grid(axis="x", alpha=0.25)
+
+        if ax.figure is not None:
+            ax.figure.tight_layout()
+
+        if show:
+            plt.show()
 
     def _forecast_to_sku_mapping(
         self,
