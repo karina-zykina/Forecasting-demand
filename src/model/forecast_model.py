@@ -9,7 +9,7 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import xgboost as xgb
+from catboost import CatBoostRegressor
 
 from .config import ForecastModelConfig
 from .preprocessing import (
@@ -55,7 +55,7 @@ class DemandForecastModel:
 
         self.encoder_state_: dict[str, Any] = {}
         self.lightgbm_model_: lgb.Booster | None = None
-        self.xgboost_model_: xgb.Booster | None = None
+        self.catboost_model_: CatBoostRegressor | None = None
         self.history_: pd.DataFrame | None = None
         self.group_frame_: pd.DataFrame | None = None
         self.last_date_: pd.Timestamp | None = None
@@ -109,7 +109,7 @@ class DemandForecastModel:
 
         final_models = self._fit_all_models(x.to_numpy(), y)
         self.lightgbm_model_ = final_models["lightgbm"]
-        self.xgboost_model_ = final_models["xgboost"]
+        self.catboost_model_ = final_models["catboost"]
 
         if not self.quality_metrics_:
             train_pred = self._predict_with_models(final_models, x.to_numpy())
@@ -198,18 +198,47 @@ class DemandForecastModel:
         forecast = self.forecast(horizon=horizon, future_features=future_features)
         return self._forecast_to_sku_mapping(forecast, sku_column=sku_column)
 
-    def get_feature_importance(self) -> dict[str, float]:
+    def get_feature_importance(
+        self,
+        plot: bool = True,
+        top_n: int | None = None,
+        show: bool = True,
+        ax: Any | None = None,
+        figsize: tuple[float, float] | None = None,
+    ) -> dict[str, float]:
+        """
+        Return ensemble feature importances and optionally draw a bar chart.
+
+        Importance is calculated for each base model, normalized inside that
+        model, and then combined with the same weights that are used for
+        ensemble predictions.
+        """
         self._check_is_fitted()
 
         feature_names = self.encoder_state_["feature_names"]
-        lgb_importance = self._normalize_importance(self.lightgbm_model_.feature_importances_)
-        xgb_importance = self._normalize_importance(self.xgboost_model_.feature_importances_)
+        weights = self._normalized_ensemble_weights()
+        lgb_importance = self._get_lightgbm_feature_importance()
+        catboost_importance = self._get_catboost_feature_importance()
 
         result: dict[str, float] = {}
         for index, feature_name in enumerate(feature_names):
-            result[feature_name] = float((lgb_importance[index] + xgb_importance[index]) / 2.0)
+            result[feature_name] = float(
+                weights["lightgbm"] * lgb_importance[index]
+                + weights["catboost"] * catboost_importance[index]
+            )
 
-        return dict(sorted(result.items(), key=lambda item: item[1], reverse=True))
+        sorted_result = dict(sorted(result.items(), key=lambda item: item[1], reverse=True))
+
+        if plot:
+            self._plot_feature_importance(
+                sorted_result,
+                top_n=top_n,
+                show=show,
+                ax=ax,
+                figsize=figsize,
+            )
+
+        return sorted_result
 
     def save(self, path: str) -> None:
         self._check_is_fitted()
@@ -226,7 +255,7 @@ class DemandForecastModel:
             "state": {
                 "encoder_state_": self.encoder_state_,
                 "lightgbm_model_": self.lightgbm_model_,
-                "xgboost_model_": self.xgboost_model_,
+                "catboost_model_": self.catboost_model_,
                 "history_": self.history_,
                 "group_frame_": self.group_frame_,
                 "last_date_": self.last_date_,
@@ -305,42 +334,46 @@ class DemandForecastModel:
         lightgbm_params.setdefault("metric", "l2")
         lightgbm_model = lgb.train(lightgbm_params, lightgbm_dataset, num_boost_round=lightgbm_rounds)
 
-        xgboost_rounds = int(self.config.xgboost_params.get("n_estimators", 250))
-        xgboost_params = self.config.xgboost_params.copy()
-        xgboost_params.pop("n_estimators", None)
-        xgboost_matrix = xgb.DMatrix(x, label=y)
-        xgboost_model = xgb.train(xgboost_params, xgboost_matrix, num_boost_round=xgboost_rounds)
+        catboost_params = self.config.catboost_params.copy()
+        catboost_params.setdefault("loss_function", "RMSE")
+        catboost_params.setdefault("verbose", False)
+        catboost_params.setdefault("allow_writing_files", False)
+        catboost_model = CatBoostRegressor(**catboost_params)
+        catboost_model.fit(x, y)
 
         return {
             "lightgbm": lightgbm_model,
-            "xgboost": xgboost_model,
+            "catboost": catboost_model,
         }
 
     def _predict_with_models(self, models: dict[str, Any], x: np.ndarray) -> np.ndarray:
         weights = self._normalized_ensemble_weights()
 
         lightgbm_pred = models["lightgbm"].predict(x)
-        xgboost_pred = models["xgboost"].predict(xgb.DMatrix(x))
+        catboost_pred = models["catboost"].predict(x)
 
         final_pred = (
             weights["lightgbm"] * lightgbm_pred
-            + weights["xgboost"] * xgboost_pred
+            + weights["catboost"] * catboost_pred
         )
         return np.asarray(final_pred, dtype=float)
 
     def _predict_one_row(self, x: np.ndarray) -> np.ndarray:
         models = {
             "lightgbm": self.lightgbm_model_,
-            "xgboost": self.xgboost_model_,
+            "catboost": self.catboost_model_,
         }
         return self._predict_with_models(models, x)
 
     def _normalized_ensemble_weights(self) -> dict[str, float]:
-        weights = self.config.ensemble_weights.copy()
+        weights = {
+            "lightgbm": float(self.config.ensemble_weights.get("lightgbm", 0.0)),
+            "catboost": float(self.config.ensemble_weights.get("catboost", 0.0)),
+        }
         total = sum(weights.values())
 
         if total <= 0:
-            return {"lightgbm": 0.5, "xgboost": 0.5}
+            return {"lightgbm": 0.5, "catboost": 0.5}
 
         for key in weights:
             weights[key] = float(weights[key] / total)
@@ -439,6 +472,57 @@ class DemandForecastModel:
             return np.zeros_like(values, dtype=float)
         return values / total
 
+    def _get_lightgbm_feature_importance(self) -> np.ndarray:
+        importance = self.lightgbm_model_.feature_importance(importance_type="gain")
+        return self._normalize_importance(importance)
+
+    def _get_catboost_feature_importance(self) -> np.ndarray:
+        importance = self.catboost_model_.get_feature_importance()
+        return self._normalize_importance(importance)
+
+    def _plot_feature_importance(
+        self,
+        importance: dict[str, float],
+        top_n: int | None,
+        show: bool,
+        ax: Any | None,
+        figsize: tuple[float, float] | None,
+    ) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise ImportError(
+                "matplotlib is required to draw feature importance. "
+                "Install it or call get_feature_importance(plot=False)."
+            ) from exc
+
+        items = list(importance.items())
+        if top_n is not None:
+            if top_n <= 0:
+                raise ValueError("top_n must be a positive integer or None.")
+            items = items[:top_n]
+
+        plot_frame = pd.DataFrame(items, columns=["feature", "importance"])
+        plot_frame = plot_frame.sort_values("importance", ascending=True)
+
+        if ax is None:
+            if figsize is None:
+                height = max(4.0, min(18.0, 0.35 * len(plot_frame) + 1.5))
+                figsize = (10.0, height)
+            _, ax = plt.subplots(figsize=figsize)
+
+        ax.barh(plot_frame["feature"], plot_frame["importance"], color="#2F80ED")
+        ax.set_title("Ensemble feature importance")
+        ax.set_xlabel("Normalized importance")
+        ax.set_ylabel("")
+        ax.grid(axis="x", alpha=0.25)
+
+        if ax.figure is not None:
+            ax.figure.tight_layout()
+
+        if show:
+            plt.show()
+
     def _forecast_to_sku_mapping(
         self,
         forecast: pd.DataFrame,
@@ -475,7 +559,7 @@ class DemandForecastModel:
         return nested
 
     def _check_is_fitted(self) -> None:
-        if self.lightgbm_model_ is None or self.xgboost_model_ is None:
+        if self.lightgbm_model_ is None or self.catboost_model_ is None:
             raise ValueError("Model is not fitted yet. Call fit(...) first.")
         if self.history_ is None:
             raise ValueError("Model history is empty. Call fit(...) first.")

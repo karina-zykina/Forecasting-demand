@@ -16,7 +16,7 @@ def setup_local_vendor() -> None:
     ]
     user_site_paths: list[str] = []
 
-    # Подключаем пользовательский site-packages, куда уже ставились lightgbm/xgboost.
+    # Подключаем пользовательский site-packages, куда уже ставились ML-зависимости.
     for user_site in site.getusersitepackages().split(";"):
         if user_site:
             user_site_paths.append(user_site)

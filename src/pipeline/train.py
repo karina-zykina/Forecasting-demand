@@ -45,7 +45,7 @@ def main() -> None:
         config=ForecastModelConfig(),
     )
 
-    # Обучаем ансамбль LightGBM + XGBoost.
+    # Обучаем ансамбль LightGBM + CatBoost.
     model.fit(df)
 
     # Сохраняем готовый артефакт, который потом можно загрузить без retrain.
