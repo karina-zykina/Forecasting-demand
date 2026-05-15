@@ -455,7 +455,7 @@ from demand_forecasting import DemandForecastModel, ForecastModelConfig
 Основные методы:
 
 - `fit(df)` обучает модель;
-- `tune_hyperparameters(df, max_trials=4)` быстро подбирает несколько простых вариантов гиперпараметров и переобучает модель на лучших настройках;
+- `tune_hyperparameters(df, max_trials=10)` подбирает гиперпараметры через Optuna и переобучает модель на лучших настройках;
 - `predict(future_df)` строит прогноз по будущей таблице;
 - `forecast(horizon)` строит прогноз только по горизонту;
 - `predict_by_sku(sku_column, future_df)` возвращает прогноз в формате `SKU: количество`;
