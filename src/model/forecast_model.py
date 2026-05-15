@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pickle
 import zipfile
-from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -128,18 +127,29 @@ class DemandForecastModel:
     def tune_hyperparameters(
         self,
         df: pd.DataFrame,
-        max_trials: int = 4,
+        max_trials: int = 20,
         fit_best: bool = True,
+        timeout: int | None = None,
+        random_state: int = 42,
     ) -> dict[str, Any]:
         """
-        Quickly tune a small set of LightGBM + CatBoost hyperparameter profiles.
+        Tune LightGBM + CatBoost hyperparameters with a compact Optuna search.
 
         The method uses the same time-based validation split as fit(...), scores
-        candidates by SMAPE, and keeps the search intentionally small so it stays
-        practical for interactive use.
+        candidates by SMAPE, and keeps the search space intentionally small so it
+        stays practical for interactive use.
         """
         if max_trials <= 0:
             raise ValueError("max_trials must be a positive integer.")
+
+        try:
+            import optuna
+        except ImportError as exc:
+            raise ImportError(
+                "optuna is required for hyperparameter tuning. "
+                "Install it with `pip install optuna`."
+            ) from exc
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         original_config = self.config
         prepared = prepare_dataframe(
@@ -182,25 +192,45 @@ class DemandForecastModel:
         y_train = y[:split_index]
         y_valid = y[split_index:]
 
-        candidates = self._build_hyperparameter_candidates(max_trials=max_trials)
         trials: list[dict[str, Any]] = []
 
+        def objective(trial: Any) -> float:
+            candidate_config = self._build_optuna_config(trial)
+            self.config = candidate_config
+            models = self._fit_all_models(x_train, y_train)
+            valid_pred = self._predict_with_models(models, x_valid)
+            metrics = self._calculate_metrics(y_valid, valid_pred)
+            quality_score = max(0.0, min(1.0, 1.0 - metrics["smape"] / 100.0))
+
+            trial.set_user_attr("metrics", metrics)
+            trial.set_user_attr("quality_score", quality_score)
+            trial.set_user_attr("config", candidate_config.to_dict())
+            return metrics["smape"]
+
+        sampler = optuna.samplers.TPESampler(seed=random_state)
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+
         try:
-            for trial_index, candidate_config in enumerate(candidates, start=1):
-                self.config = candidate_config
-                models = self._fit_all_models(x_train, y_train)
-                valid_pred = self._predict_with_models(models, x_valid)
-                metrics = self._calculate_metrics(y_valid, valid_pred)
-                trials.append(
-                    {
-                        "trial": trial_index,
-                        "metrics": metrics,
-                        "quality_score": max(0.0, min(1.0, 1.0 - metrics["smape"] / 100.0)),
-                        "config": candidate_config.to_dict(),
-                    }
-                )
+            study.optimize(objective, n_trials=max_trials, timeout=timeout, show_progress_bar=False)
         finally:
             self.config = original_config
+
+        for trial in study.trials:
+            if trial.value is None:
+                continue
+            trials.append(
+                {
+                    "trial": trial.number + 1,
+                    "value": float(trial.value),
+                    "params": dict(trial.params),
+                    "metrics": trial.user_attrs["metrics"],
+                    "quality_score": trial.user_attrs["quality_score"],
+                    "config": trial.user_attrs["config"],
+                }
+            )
+
+        if not trials:
+            raise ValueError("Optuna did not complete any tuning trials.")
 
         trials.sort(key=lambda item: item["metrics"]["smape"])
         best_trial = trials[0]
@@ -226,6 +256,7 @@ class DemandForecastModel:
         return {
             "best_config": best_config.to_dict(),
             "best_trial": best_trial["trial"],
+            "best_params": best_trial["params"],
             "best_metrics": best_trial["metrics"],
             "best_quality_score": best_trial["quality_score"],
             "trials": trials,
@@ -435,85 +466,49 @@ class DemandForecastModel:
 
         return ForecastModelConfig.from_dict(payload)
 
-    def _build_hyperparameter_candidates(self, max_trials: int) -> list[ForecastModelConfig]:
+    def _build_optuna_config(self, trial: Any) -> ForecastModelConfig:
         base_payload = self.config.to_dict()
-        overrides = [
-            {},
-            {
-                "lightgbm_params": {
-                    "n_estimators": 120,
-                    "learning_rate": 0.08,
-                    "max_depth": 4,
-                    "num_leaves": 15,
-                },
-                "catboost_params": {
-                    "iterations": 120,
-                    "learning_rate": 0.08,
-                    "depth": 4,
-                    "l2_leaf_reg": 5.0,
-                },
-            },
-            {
-                "lightgbm_params": {
-                    "n_estimators": 180,
-                    "learning_rate": 0.05,
-                    "max_depth": 5,
-                    "num_leaves": 31,
-                },
-                "catboost_params": {
-                    "iterations": 180,
-                    "learning_rate": 0.05,
-                    "depth": 5,
-                    "l2_leaf_reg": 3.0,
-                },
-            },
-            {
-                "lightgbm_params": {
-                    "n_estimators": 220,
-                    "learning_rate": 0.03,
-                    "max_depth": 6,
-                    "num_leaves": 31,
-                },
-                "catboost_params": {
-                    "iterations": 220,
-                    "learning_rate": 0.03,
-                    "depth": 6,
-                    "l2_leaf_reg": 3.0,
-                },
-            },
-            {
-                "ensemble_weights": {
-                    "lightgbm": 0.65,
-                    "catboost": 0.35,
-                },
-            },
-            {
-                "ensemble_weights": {
-                    "lightgbm": 0.35,
-                    "catboost": 0.65,
-                },
-            },
-        ]
+        lightgbm_params = base_payload["lightgbm_params"].copy()
+        catboost_params = base_payload["catboost_params"].copy()
 
-        candidates: list[ForecastModelConfig] = []
-        seen: set[str] = set()
-        for override in overrides[:max_trials]:
-            payload = deepcopy(base_payload)
-            self._deep_update(payload, override)
-            config = ForecastModelConfig.from_dict(payload)
-            key = repr(config.to_dict())
-            if key not in seen:
-                seen.add(key)
-                candidates.append(config)
+        lightgbm_params.update(
+            {
+                "n_estimators": trial.suggest_int("lightgbm_n_estimators", 60, 260, step=40),
+                "learning_rate": trial.suggest_float("lightgbm_learning_rate", 0.02, 0.12, log=True),
+                "max_depth": trial.suggest_int("lightgbm_max_depth", 3, 8),
+                "num_leaves": trial.suggest_categorical("lightgbm_num_leaves", [15, 31, 63]),
+                "subsample": trial.suggest_float("lightgbm_subsample", 0.7, 1.0),
+                "colsample_bytree": trial.suggest_float("lightgbm_colsample_bytree", 0.7, 1.0),
+                "min_child_samples": trial.suggest_categorical(
+                    "lightgbm_min_child_samples", [10, 20, 40]
+                ),
+            }
+        )
 
-        return candidates
+        catboost_params.update(
+            {
+                "iterations": trial.suggest_int("catboost_iterations", 60, 260, step=40),
+                "learning_rate": trial.suggest_float("catboost_learning_rate", 0.02, 0.12, log=True),
+                "depth": trial.suggest_int("catboost_depth", 3, 8),
+                "l2_leaf_reg": trial.suggest_float("catboost_l2_leaf_reg", 1.0, 10.0, log=True),
+                "subsample": trial.suggest_float("catboost_subsample", 0.7, 1.0),
+                "random_strength": trial.suggest_float("catboost_random_strength", 0.0, 2.0),
+                "bootstrap_type": "Bernoulli",
+                "loss_function": "RMSE",
+                "verbose": False,
+                "allow_writing_files": False,
+            }
+        )
 
-    def _deep_update(self, target: dict[str, Any], override: dict[str, Any]) -> None:
-        for key, value in override.items():
-            if isinstance(value, dict) and isinstance(target.get(key), dict):
-                target[key].update(value)
-            else:
-                target[key] = value
+        lightgbm_weight = trial.suggest_float("lightgbm_weight", 0.2, 0.8)
+        base_payload["lightgbm_params"] = lightgbm_params
+        base_payload["catboost_params"] = catboost_params
+        base_payload["ensemble_weights"] = {
+            "lightgbm": lightgbm_weight,
+            "catboost": 1.0 - lightgbm_weight,
+        }
+
+        return ForecastModelConfig.from_dict(base_payload)
 
     def _fit_all_models(self, x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
         lightgbm_dataset = lgb.Dataset(x, label=y)

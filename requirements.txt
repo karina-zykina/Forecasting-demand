@@ -4,3 +4,4 @@ scipy>=1.10
 lightgbm>=4.0
 catboost>=1.2
 matplotlib>=3.8
+optuna>=3.6
